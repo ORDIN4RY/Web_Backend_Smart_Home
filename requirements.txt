@@ -1,0 +1,24 @@
+# ============================================================
+# requirements.txt — Dependensi Python Backend Flask
+# ============================================================
+
+# --- Web Framework ---
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# --- WSGI Server (produksi, lebih stabil dari Flask dev server) ---
+waitress>=3.0.0
+
+# --- Computer Vision ---
+# Pin <5 karena OpenCV 5.x menghapus CascadeClassifier (Haar fallback)
+# Pin >=4.10 karena YuNet (FaceDetectorYN) butuh minimal 4.10
+opencv-python>=4.10.0,<5.0.0
+
+# --- Deep Learning (MobileFaceNet) ---
+# CPU-only: lebih ringan, cukup untuk inferensi di laptop
+# Jika GPU tersedia, hapus --index-url dan install torch normal
+torch>=2.0.0
+
+# --- Image & Array ---
+pillow>=10.0.0
+numpy>=1.24.0

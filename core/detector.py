@@ -175,6 +175,7 @@ class Detector:
                 "x": fx, "y": fy, "w": fw, "h": fh,
                 "score": round(score, 3), "landmarks": landmarks,
                 "accepted": accepted, "reason": reason,
+                "raw": face,
             })
         return details
 

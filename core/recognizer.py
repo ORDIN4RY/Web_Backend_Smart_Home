@@ -1,67 +1,26 @@
 """
-core/recognizer.py — Face recognition berbasis MobileFaceNet (PyTorch).
+core/recognizer.py — Face recognition berbasis SFace (OpenCV FaceRecognizerSF)
+dengan fallback opsional ke MobileFaceNet (PyTorch).
 
-Pipeline:
-  1. Crop / alignment 5-titik landmark (standar ArcFace 112x112)
-  2. Normalisasi pixel: [0,255] -> [-1,1]
-  3. Inferensi MobileFaceNet -> embedding 128-D
-  4. L2-normalize embedding
-  5. Cosine similarity ke semua prototype (dot product karena sudah unit vector)
+Default backend: SFace (ONNX native via OpenCV DNN).
+Keunggulan SFace:
+  - Berpasangan resmi dengan YuNet
+  - Alignment instan via cv2.FaceRecognizerSF.alignCrop
+  - Sangat ringan & cepat di CPU (C++ OpenCV engine, tanpa overhead PyTorch)
+  - Vektor fitur 128-D L2-normalized
+  - Rekomendasi threshold Cosine: 0.363
 """
 
-import importlib.util
 from pathlib import Path
+import cv2
+import numpy as np
 
 IMG_SIZE = 112
-
-# Koordinat 5-titik acuan kanonikal ArcFace / InsightFace (standar 112x112)
-REFERENCE_PTS = (
-    (38.2946, 51.6963),  # mata kanan (kiri di gambar)
-    (73.5318, 51.5014),  # mata kiri (kanan di gambar)
-    (56.0252, 71.7366),  # ujung hidung
-    (41.5493, 92.3655),  # sudut mulut kanan
-    (70.7299, 92.2041),  # sudut mulut kiri
-)
-
-
-# ---------------------------------------------------------------------------
-# Helper: Align 5-titik + crop
-# ---------------------------------------------------------------------------
-
-def align_face_5pt(frame, landmarks, target_size: int = IMG_SIZE):
-    """
-    Transformasi afin 5 titik landmark YuNet ke koordinat kanonikal ArcFace.
-    Memastikan mata/hidung/bibir selalu di posisi yang sama sebelum masuk MFN.
-    Kembalikan crop BGR (target_size x target_size) atau None jika gagal.
-    """
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        return None
-    if landmarks is None or len(landmarks) != 5:
-        return None
-    src_pts = numpy_pts(landmarks)
-    ref_pts = numpy_pts(REFERENCE_PTS)
-    if target_size != IMG_SIZE:
-        ref_pts = ref_pts * (float(target_size) / IMG_SIZE)
-    tform, _ = cv2.estimateAffinePartial2D(src_pts, ref_pts)
-    if tform is None:
-        return None
-    return cv2.warpAffine(frame, tform, (target_size, target_size), borderValue=0.0)
-
-
-def numpy_pts(pts):
-    import numpy as np
-    return np.array(pts, dtype=np.float32)
+DEFAULT_SFACE_THRESHOLD = 0.363
 
 
 def clamp_crop(frame, x, y, w, h, margin: float = 0.0):
-    """
-    Potong bounding box + margin, dijepit ke frame.
-    Kembalikan BGR crop atau None jika terlalu kecil.
-    Margin harus SAMA antara enroll dan recognition.
-    """
+    """Potong bounding box + margin, dijepit ke dimensi frame."""
     height, width = frame.shape[:2]
     cx, cy = x + w / 2, y + h / 2
     nw, nh = w * (1 + 2 * margin), h * (1 + 2 * margin)
@@ -74,128 +33,180 @@ def clamp_crop(frame, x, y, w, h, margin: float = 0.0):
     return frame[y0:y1, x0:x1]
 
 
-# ---------------------------------------------------------------------------
-# Class Recognizer
-# ---------------------------------------------------------------------------
-
 class Recognizer:
     """
-    Wrapper inferensi MobileFaceNet.
-
-    Memuat backbone via infer_mfn.py (load_backbone) secara lazy saat
-    __init__ — jika torch atau file bobot belum ada, `ready` = False
-    dan server tetap bisa menjawab request lain.
+    Wrapper model pengenalan wajah.
+    Mendukung SFace (default) dan MobileFaceNet (opsional fallback).
     """
 
     def __init__(
         self,
+        sface_model: str = "models/face_recognition_sface_2021dec.onnx",
+        backend: str = "sface",
         infer_script: str = "infer_mfn.py",
         mfn_repo: str = "MobileFaceNet",
         pretrained: str = "MobileFaceNet/weights/mobilefacenet.pt",
     ):
         self.ready = False
+        self.kind = "tidak_ada"
         self.reason = ""
-        self.model = None
-        self._mod = None
-        self._load(infer_script, mfn_repo, pretrained)
+        self.backend = (backend or "sface").lower()
+        self._sface = None
+        self._mfn_model = None
 
-    def _load(self, infer_script: str, mfn_repo: str, pretrained: str):
-        # Cek torch
-        try:
-            import torch  # noqa: F401
-        except ImportError as exc:
-            self.reason = f"torch belum terpasang ({exc})"
+        if self.backend == "sface":
+            self._init_sface(sface_model)
+            if not self.ready and Path(pretrained).exists():
+                print(f"[recognizer] SFace gagal ({self.reason}); mencoba fallback MobileFaceNet...")
+                self._init_mfn(infer_script, mfn_repo, pretrained)
+        else:
+            self._init_mfn(infer_script, mfn_repo, pretrained)
+
+    def _init_sface(self, sface_model: str):
+        p = Path(sface_model)
+        if not p.exists():
+            self.reason = f"File model SFace tidak ditemukan: {sface_model}"
             return
 
-        # Load modul infer_mfn.py dinamis (agar tidak butuh restructure infer_mfn)
-        spec = importlib.util.spec_from_file_location("infer_mfn", infer_script)
-        if spec is None or spec.loader is None:
-            self.reason = f"infer_mfn.py tidak ketemu di: {infer_script}"
-            return
         try:
+            if hasattr(cv2, "FaceRecognizerSF_create"):
+                self._sface = cv2.FaceRecognizerSF_create(str(p), "")
+            elif hasattr(cv2, "FaceRecognizerSF"):
+                self._sface = cv2.FaceRecognizerSF.create(str(p), "")
+            else:
+                self.reason = "OpenCV tidak memiliki FaceRecognizerSF (perlu opencv-python >= 4.5.4)"
+                return
+
+            self.ready = True
+            self.kind = "sface"
+            print(f"[recognizer] SFace ONNX dimuat dari {sface_model}", flush=True)
+        except Exception as exc:
+            self.reason = f"Gagal inisialisasi SFace ({exc})"
+
+    def _init_mfn(self, infer_script: str, mfn_repo: str, pretrained: str):
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("infer_mfn", infer_script)
+            if spec is None or spec.loader is None:
+                self.reason = f"infer_mfn.py tidak ketemu: {infer_script}"
+                return
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
+            self._mfn_model = mod.load_backbone(mfn_repo, pretrained)
+            self.ready = True
+            self.kind = "mobilefacenet"
+            print(f"[recognizer] MobileFaceNet dimuat dari {pretrained}", flush=True)
         except Exception as exc:
-            self.reason = f"gagal memuat infer_mfn.py ({exc})"
-            return
-
-        # Load bobot MobileFaceNet
-        try:
-            self.model = mod.load_backbone(mfn_repo, pretrained)
-        except SystemExit as exc:
-            self.reason = str(exc)
-            return
-        except Exception as exc:
-            self.reason = f"gagal memuat bobot MFN ({exc})"
-            return
-
-        self._mod = mod
-        self.ready = True
-        print(f"[recognizer] MobileFaceNet dimuat dari {pretrained}")
+            self.reason = f"Gagal memuat MobileFaceNet ({exc})"
 
     # ------------------------------------------------------------------
-    # Embedding
+    # Ekstraksi Fitur / Embedding
     # ------------------------------------------------------------------
 
     def embedding_from_crop(self, bgr_crop):
-        """
-        Hitung embedding 128-D dari crop BGR (sudah di-resize ke IMG_SIZE x IMG_SIZE).
-        Kembalikan numpy array float32 yang sudah L2-normalized.
-        """
-        import numpy as np
-        import torch
-        import torch.nn as nn
-        from PIL import Image
+        """Hitung embedding 128-D dari crop gambar wajah (BGR)."""
+        if not self.ready or bgr_crop is None:
+            return None
 
-        rgb = bgr_crop[:, :, ::-1]
-        img = Image.fromarray(rgb).resize((IMG_SIZE, IMG_SIZE))
-        arr = np.asarray(img, dtype=np.float32) / 255.0
-        arr = (arr - 0.5) / 0.5                       # normalisasi ke [-1, 1]
-        arr = np.transpose(arr, (2, 0, 1))             # HWC -> CHW
-        x = torch.from_numpy(arr).unsqueeze(0)
-        with torch.no_grad():
-            emb = self.model(x)
-            if emb.dim() > 2:
-                emb = emb.flatten(1)
-            emb = nn.functional.normalize(emb, p=2, dim=1)
-        return emb.numpy()[0]
+        if self.kind == "sface":
+            try:
+                # SFace mengharapkan crop 112x112
+                if bgr_crop.shape[:2] != (IMG_SIZE, IMG_SIZE):
+                    bgr_crop = cv2.resize(bgr_crop, (IMG_SIZE, IMG_SIZE))
+                feat = self._sface.feature(bgr_crop)
+                emb = np.array(feat[0], dtype=np.float32)
+                norm = np.linalg.norm(emb)
+                if norm > 0:
+                    emb = emb / norm
+                return emb
+            except Exception as exc:
+                print(f"[recognizer] SFace feature error: {exc}")
+                return None
 
-    def embedding_from_frame(self, frame, box, landmarks=None, margin: float = 0.0):
+        # Fallback MFN
+        if self.kind == "mobilefacenet" and self._mfn_model is not None:
+            try:
+                import torch
+                import torch.nn as nn
+                from PIL import Image
+                rgb = bgr_crop[:, :, ::-1]
+                img = Image.fromarray(rgb).resize((IMG_SIZE, IMG_SIZE))
+                arr = np.asarray(img, dtype=np.float32) / 255.0
+                arr = (arr - 0.5) / 0.5
+                arr = np.transpose(arr, (2, 0, 1))
+                x = torch.from_numpy(arr).unsqueeze(0)
+                with torch.no_grad():
+                    emb = self._mfn_model(x)
+                    if emb.dim() > 2:
+                        emb = emb.flatten(1)
+                    emb = nn.functional.normalize(emb, p=2, dim=1)
+                return emb.numpy()[0]
+            except Exception:
+                return None
+
+        return None
+
+    def embedding_from_frame(self, frame, box, landmarks=None, raw=None, margin: float = 0.0):
         """
-        Hitung embedding dari frame mentah (BGR) + box + opsional landmarks.
-        Prioritas: 5-pt alignment (lebih akurat) > tight crop.
-        Kembalikan numpy array atau None.
+        Hitung embedding dari frame lengkap.
+        SFace memanfaatkan alignCrop bawaan OpenCV jika raw/landmarks tersedia.
         """
-        if landmarks is not None and len(landmarks) == 5:
-            aligned = align_face_5pt(frame, landmarks, IMG_SIZE)
-            if aligned is not None:
-                return self.embedding_from_crop(aligned)
+        if not self.ready:
+            return None
+
+        if self.kind == "sface":
+            # 1. Prioritas: alignCrop menggunakan raw 15-elemen dari YuNet
+            if raw is not None:
+                try:
+                    face_arr = np.asarray(raw, dtype=np.float32)
+                    aligned = self._sface.alignCrop(frame, face_arr)
+                    return self.embedding_from_crop(aligned)
+                except Exception:
+                    pass
+
+            # 2. Alternatif: rakit array 15-elemen dari box + landmarks
+            if landmarks is not None and len(landmarks) == 5:
+                try:
+                    face_arr = np.array([
+                        box[0], box[1], box[2], box[3],
+                        landmarks[0][0], landmarks[0][1],
+                        landmarks[1][0], landmarks[1][1],
+                        landmarks[2][0], landmarks[2][1],
+                        landmarks[3][0], landmarks[3][1],
+                        landmarks[4][0], landmarks[4][1],
+                        1.0,
+                    ], dtype=np.float32)
+                    aligned = self._sface.alignCrop(frame, face_arr)
+                    return self.embedding_from_crop(aligned)
+                except Exception:
+                    pass
+
+            # 3. Fallback: crop manual + resize
+            crop = clamp_crop(frame, *box, margin=margin)
+            if crop is not None:
+                return self.embedding_from_crop(crop)
+            return None
+
+        # Fallback MFN path
         crop = clamp_crop(frame, *box, margin=margin)
         if crop is not None:
             return self.embedding_from_crop(crop)
         return None
 
     def embedding_from_image_bytes(self, image_bytes: bytes):
-        """
-        Hitung embedding dari bytes gambar (JPEG/PNG dari upload mobile).
-        Deteksi wajah dilakukan di sini jika dibutuhkan; atau langsung pakai full frame
-        (cocok jika mobile sudah crop wajah sebelum mengirim).
-        Kembalikan numpy array atau None.
-        """
+        """Hitung embedding dari raw image bytes (upload mobile)."""
         try:
-            import numpy as np
-            import cv2
             arr = np.frombuffer(image_bytes, np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if frame is None:
                 return None, "gambar tidak bisa di-decode"
-            # Gunakan full frame sebagai crop; resize ke 112x112
-            return self.embedding_from_crop(cv2.resize(frame, (IMG_SIZE, IMG_SIZE))), None
+            crop = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
+            return self.embedding_from_crop(crop), None
         except Exception as exc:
             return None, str(exc)
 
     # ------------------------------------------------------------------
-    # Matching
+    # Pencocokan / Cosine Similarity
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -204,22 +215,10 @@ class Recognizer:
         Cosine similarity (dot product) ke semua prototype.
         Kembalikan (nama, skor) terbaik, atau (None, 0.0) jika kosong.
         """
-        import numpy as np
-
-        if not prototypes:
+        if not prototypes or embedding is None:
             return None, 0.0
         names = sorted(prototypes.keys())
         mat = np.stack([prototypes[n]["embedding"] for n in names])
         sims = mat @ embedding
         best = int(np.argmax(sims))
         return names[best], float(sims[best])
-
-    # ------------------------------------------------------------------
-    # Batch enroll dari direktori (kompatibilitas infer_mfn.py)
-    # ------------------------------------------------------------------
-
-    def build_prototypes_from_dir(self, enroll_dir: str):
-        """Baca subfolder per orang, hitung prototype; kembalikan dict."""
-        if self._mod is None:
-            raise RuntimeError("Recognizer belum siap")
-        return self._mod.build_prototypes(self.model, enroll_dir, IMG_SIZE)

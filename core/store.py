@@ -8,7 +8,7 @@ import json
 import threading
 from pathlib import Path
 
-DEFAULT_THRESHOLD = 0.5
+DEFAULT_THRESHOLD = 0.363
 DEFAULT_FAS_THRESHOLD = 0.60
 DEFAULT_MARGIN = 0.0
 
@@ -31,7 +31,7 @@ class Store:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.config_path = self.dir / "config.json"
         self.faces_path = self.dir / "faces.json"
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         # faces: nama -> {embedding: np.ndarray, jumlah_frame: int, diperbarui: str}
         self.faces: dict = {}
         self.config: dict = {}

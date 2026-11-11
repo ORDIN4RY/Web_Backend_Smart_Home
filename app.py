@@ -58,11 +58,13 @@ def create_app(engine_cfg: dict) -> Flask:
     from routes.faces import faces_bp
     from routes.recognize import recognize_bp
     from routes.config import config_bp
+    from routes.devices import devices_bp
 
     app.register_blueprint(health_bp)
     app.register_blueprint(faces_bp)
     app.register_blueprint(recognize_bp)
     app.register_blueprint(config_bp)
+    app.register_blueprint(devices_bp)
 
     # ----- Root endpoint: ringkasan API (bukan HTML) -----
     @app.get("/")
@@ -117,6 +119,10 @@ def parse_args():
         "--source", default="none",
         help="'none' (default, mobile-only) | angka webcam (misal 0) | URL stream MJPEG ESP32-CAM"
     )
+    ap.add_argument("--sface-model", default=os.path.join("models", "face_recognition_sface_2021dec.onnx"),
+                    help="Path ke model SFace ONNX")
+    ap.add_argument("--model-backend", default="sface", choices=["sface", "mobilefacenet"],
+                    help="Backend pengenalan wajah: 'sface' (default) | 'mobilefacenet'")
     ap.add_argument("--data-dir", default="api_data")
     ap.add_argument("--mfn-repo", default="MobileFaceNet")
     ap.add_argument(
@@ -141,6 +147,8 @@ def build_engine_cfg(args) -> dict:
     """Susun dict konfigurasi Engine dari argparse + default."""
     cfg = {
         "data_dir":      args.data_dir,
+        "sface_model":   args.sface_model,
+        "model_backend": args.model_backend,
         "mfn_repo":      args.mfn_repo,
         "pretrained":    args.pretrained,
         "infer_script":  args.infer_script,

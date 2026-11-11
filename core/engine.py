@@ -87,6 +87,8 @@ class Engine:
             cfg.get("yunet_model", "face_detection_yunet_2023mar.onnx")
         )
         self.recognizer = Recognizer(
+            sface_model=cfg.get("sface_model", "models/face_recognition_sface_2021dec.onnx"),
+            backend=cfg.get("model_backend", self.store.config.get("model_backend", "sface")),
             infer_script=cfg.get("infer_script", "infer_mfn.py"),
             mfn_repo=cfg.get("mfn_repo", "MobileFaceNet"),
             pretrained=cfg.get("pretrained", "MobileFaceNet/weights/mobilefacenet.pt"),
@@ -245,6 +247,7 @@ class Engine:
             emb = self.recognizer.embedding_from_frame(
                 frame, box0,
                 landmarks=best_d.get("landmarks"),
+                raw=best_d.get("raw"),
                 margin=self.store.margin(),
             )
             if emb is None:
@@ -309,6 +312,7 @@ class Engine:
             emb = self.recognizer.embedding_from_frame(
                 frame, box0,
                 landmarks=best_d.get("landmarks"),
+                raw=best_d.get("raw"),
                 margin=self.store.margin(),
             )
             if emb is not None:
@@ -369,6 +373,7 @@ class Engine:
             emb = self.recognizer.embedding_from_frame(
                 frame, box0,
                 landmarks=best_d.get("landmarks"),
+                raw=best_d.get("raw"),
                 margin=self.store.margin(),
             )
             if emb is None:
@@ -452,6 +457,7 @@ class Engine:
             emb = self.recognizer.embedding_from_frame(
                 frame, box0,
                 landmarks=best_d.get("landmarks"),
+                raw=best_d.get("raw"),
                 margin=self.store.margin(),
             )
             if emb is None:

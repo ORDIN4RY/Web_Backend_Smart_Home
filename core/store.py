@@ -112,6 +112,29 @@ class Store:
             }
         self.save_faces()
 
+    def set_face_lbph(self, nama: str, histogram):
+        """Simpan atau perbarui prototype histogram LBPH (Computer Vision)."""
+        import numpy as np
+        vec = np.asarray(histogram, dtype=np.float32)
+        lbph_file = self.dir / "faces_lbph.json"
+        with self.lock:
+            db = self.lbph_prototypes()
+            db[nama] = {
+                "histogram": vec.tolist(),
+                "diperbarui": _now_iso(),
+            }
+            lbph_file.write_text(json.dumps(db, ensure_ascii=False), encoding="utf-8")
+
+    def lbph_prototypes(self) -> dict:
+        """Baca prototype histogram LBPH dari faces_lbph.json."""
+        lbph_file = self.dir / "faces_lbph.json"
+        if not lbph_file.exists():
+            return {}
+        try:
+            return json.loads(lbph_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
     def remove_face(self, nama: str) -> bool:
         """Hapus wajah; kembalikan True jika sebelumnya ada."""
         with self.lock:

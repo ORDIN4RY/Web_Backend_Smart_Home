@@ -62,7 +62,8 @@ def recognize():
     if isinstance(image_bytes, tuple):          # error response
         return image_bytes
 
-    code, payload = eng.recognize_photo(image_bytes)
+    mode = request.form.get("mode") or request.args.get("mode") or "ai"
+    code, payload = eng.recognize_photo(image_bytes, mode=mode)
     return jsonify(payload), code
 
 

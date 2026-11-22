@@ -112,18 +112,24 @@ class Store:
             }
         self.save_faces()
 
-    def set_face_lbph(self, nama: str, histogram):
+    def set_face_lbph(self, nama: str, histogram, exemplars=None):
         """Simpan atau perbarui prototype histogram LBPH (Computer Vision)."""
         import numpy as np
         vec = np.asarray(histogram, dtype=np.float32)
         lbph_file = self.dir / "faces_lbph.json"
         with self.lock:
             db = self.lbph_prototypes()
+            ex_list = exemplars if exemplars is not None else [vec.tolist()]
+            if nama in db and "exemplars" in db[nama] and exemplars is None:
+                ex_list = db[nama]["exemplars"]
+                if len(ex_list) < 15:
+                    ex_list.append(vec.tolist())
             db[nama] = {
+                "exemplars": ex_list,
                 "histogram": vec.tolist(),
                 "diperbarui": _now_iso(),
             }
-            lbph_file.write_text(json.dumps(db, ensure_ascii=False), encoding="utf-8")
+            lbph_file.write_text(json.dumps(db, separators=(',', ':'), ensure_ascii=False), encoding="utf-8")
 
     def lbph_prototypes(self) -> dict:
         """Baca prototype histogram LBPH dari faces_lbph.json."""

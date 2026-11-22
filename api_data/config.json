@@ -6,7 +6,7 @@
   "pretrained": "MobileFaceNet\\weights\\mobilefacenet.pt",
   "yunet_model": "face_detection_yunet_2023mar.onnx",
   "source": "none",
-  "fas_threshold": 0.6,
+  "fas_threshold": 0.42,
   "fas_model_dir": "fas/models",
   "model_backend": "sface"
 }

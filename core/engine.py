@@ -74,48 +74,113 @@ def _extract_lbp(gray_crop, grid_x=8, grid_y=8, return_image=False):
     return (vec, lbp) if return_image else vec
 
 
-def _to_b64(img):
-    """Encode citra ke base64 JPEG kecil untuk visualisasi tahapan pipeline CV."""
+def _to_b64(img, target_size=260, quality=88):
+    """
+    Encode citra ke base64 JPEG resolusi tinggi & jernih untuk UI.
+    Mempertahankan aspect ratio dan menskalakan agar tajam & tidak kecil/buram.
+    """
     import base64
     import cv2
-    _, buf = cv2.imencode(".jpg", cv2.resize(img, (80, 80)), [cv2.IMWRITE_JPEG_QUALITY, 75])
+    if img is None or img.size == 0:
+        return ""
+    h, w = img.shape[:2]
+    if max(h, w) > target_size:
+        scale = target_size / max(h, w)
+        resized = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    elif max(h, w) < 180:
+        scale = 220 / max(h, w)
+        resized = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_NEAREST)
+    else:
+        resized = img
+    _, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return base64.b64encode(buf).decode("ascii")
 
 
-def _check_cv_liveness(face_bgr):
+def _render_hist_preview(vec, width=320, height=130):
+    """Render kurva visualisasi profil histogram LBPH (OpenCV murni tanpa overhead)."""
+    import cv2
+    import numpy as np
+    canvas = np.full((height, width, 3), 248, dtype=np.uint8)  # Background abu-abu muda
+    bins = 64
+    chunk = max(1, len(vec) // bins)
+    sampled = [float(np.mean(vec[i * chunk:(i + 1) * chunk])) for i in range(bins)]
+    max_v = max(sampled) if max(sampled) > 0 else 1.0
+    bar_w = max(1, width // bins)
+    for i, v in enumerate(sampled):
+        h_bar = int((v / max_v) * (height - 24))
+        x1 = i * bar_w
+        x2 = min(width - 1, (i + 1) * bar_w - 1)
+        y2 = height - 10
+        y1 = max(10, y2 - h_bar)
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), (180, 80, 50), -1)  # Steelblue
+    cv2.rectangle(canvas, (0, 0), (width - 1, height - 1), (190, 190, 190), 1)
+    return canvas
+
+
+def _load_color_lbp_proto():
+    """Muat prototipe Color-LBP wajah asli untuk liveness detection (Boulkenafet et al., 2016)."""
+    import json
+    from pathlib import Path
+    import numpy as np
+
+    proto_path = Path(__file__).resolve().parent.parent / "api_data" / "color_lbp_proto.json"
+    if proto_path.exists():
+        try:
+            data = json.loads(proto_path.read_text(encoding="utf-8"))
+            return np.asarray(data["proto"], dtype=np.float32)
+        except Exception:
+            pass
+    return None
+
+_COLOR_LBP_PROTO = _load_color_lbp_proto()
+
+
+def _check_cv_liveness(face_bgr, threshold: float = 0.52):
     """
-    Anti-spoofing Computer Vision Klasik (Non-Pretrained).
-    Berdasarkan analisis persebaran krominans dan saturasi multi-ruang warna
-    (HSV Saturation & YCrCb Chrominance) tanpa model deep learning.
-    Ref: Z. Boulkenafet et al., 'Face Anti-Spoofing Based on Color Texture Analysis', IEEE TIFS.
+    Gatekeeper 1: Color Texture Analysis Face Anti-Spoofing.
+    Fusi analisis ruang warna & ketajaman mikro (Tanpa GLCM, Tanpa SVM):
+      1. YCrCb: Dispersi krominans alami (pantulan hemoglobin Cr + melanin Cb)
+      2. HSV: Saturasi warna dan sebaran intensitas (kompresi gamut layar)
+      3. Laplacian Variance: Ketajaman mikro-tekstur (re-capture blur vs mikro-pori kulit asli)
+    Ref:
+      - Z. Boulkenafet et al., 'Face Anti-Spoofing Based on Color Texture Analysis', IEEE TIFS 2016.
     """
     import cv2
     import numpy as np
 
     if face_bgr is None or face_bgr.size == 0:
-        return False, 0.0, 0.0
+        return False, 0.0, 0.0, 0.0, 0.0
 
-    face_resized = cv2.resize(face_bgr, (128, 128))
-    hsv = cv2.cvtColor(face_resized, cv2.COLOR_BGR2HSV)
-    ycrcb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2YCrCb)
+    face = cv2.resize(face_bgr, (128, 128))
+    ycrcb = cv2.cvtColor(face, cv2.COLOR_BGR2YCrCb)
+    hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
 
-    # 1. Analisis deviasi saturasi HSV & krominans YCrCb
-    # Kulit biologis hidup memiliki persebaran pigmen darah dinamis (Cr & Cb tinggi)
-    # Foto pada layar gadget / kertas cetak mengalami gamut clipping & desaturasi
-    sat_std = float(np.std(hsv[:, :, 1]))
-    cr_std = float(np.std(ycrcb[:, :, 1]))
-    cb_std = float(np.std(ycrcb[:, :, 2]))
-    c_var = sat_std + (cr_std * 1.5) + (cb_std * 1.5)
+    sat = hsv[:, :, 1].astype(float)
+    cr = ycrcb[:, :, 1].astype(float)
+    cb = ycrcb[:, :, 2].astype(float)
 
-    # 2. Skor normalisasi liveness (range dinamis c_var 25.0 - 75.0)
-    score = (c_var - 25.0) / 50.0
-    score_clamped = round(max(0.0, min(1.0, score)), 3)
+    sat_mean = float(np.mean(sat))
+    sat_std = float(np.std(sat))
+    cr_std = float(np.std(cr))
+    cb_std = float(np.std(cb))
 
-    # Threshold toleran untuk kamera ponsel indoor (0.45)
-    # Memastikan wajah asli 100% lolos tanpa false rejection, sambil memblokir spoof layar redup
-    threshold = 0.45
-    is_real = bool(score_clamped >= threshold)
-    return is_real, score_clamped, round(c_var, 2)
+    # 1. Dispersi krominan alami (pantulan hemoglobin Cr + melanin Cb)
+    c_var = sat_std + (1.5 * cr_std) + (1.5 * cb_std)
+
+    # 2. Ketajaman mikro-tekstur (Laplacian variance: re-capture blur layar vs kulit asli)
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    # Skor komponen ternormalisasi 0.0 - 1.0 (NO GLCM, NO SVM)
+    s_col = max(0.0, min(1.0, (c_var - 25.0) / 45.0))
+    s_sat = max(0.0, min(1.0, (sat_mean - 35.0) / 50.0))
+    s_lap = max(0.0, min(1.0, (lap_var - 30.0) / 70.0))
+
+    # Fusi bobot: Dispersi warna 40%, Saturasi 35%, Ketajaman mikro 25%
+    liveness_score = round(float(0.40 * s_col + 0.35 * s_sat + 0.25 * s_lap), 3)
+    is_real = bool(liveness_score >= threshold and c_var >= 36.0 and sat_mean >= 38.0)
+
+    return is_real, liveness_score, round(c_var, 2), round(sat_mean, 1), round(lap_var, 1)
 
 
 class Engine:
@@ -296,17 +361,28 @@ class Engine:
         best_d = accepted[0]
         box0 = (best_d["x"], best_d["y"], best_d["w"], best_d["h"])
 
-        # Tahap 1: Liveness
+        # Tahap 1: Liveness (MiniFASNet + MCTA Guard)
         is_real, liveness_score = True, 1.0
         if self.fas.ready:
             is_real, liveness_score, _ = self.fas.check(frame, box0)
             is_real = bool(is_real and liveness_score >= self.store.fas_threshold())
+
+        # MCTA Guard: tangkal serangan layar smartphone (OLED/AMOLED) yang lolos dari MiniFASNet
+        if is_real:
+            bx, by, bw, bh = box0
+            patch_crop = frame[max(0, by):min(frame.shape[0], by + bh), max(0, bx):min(frame.shape[1], bx + bw)]
+            if patch_crop.size > 0:
+                is_real_mcta, mcta_score, c_var, _, _ = _check_cv_liveness(patch_crop, threshold=0.50)
+                if not is_real_mcta:
+                    is_real = False
+                    liveness_score = round(float(mcta_score), 3)
+
         patch["liveness"] = is_real
         patch["liveness_skor"] = round(float(liveness_score), 3)
 
         if not is_real:
             patch["granted"] = False
-            patch["catatan"] = f"DITOLAK: spoof terdeteksi (skor real: {liveness_score:.2f})"
+            patch["catatan"] = f"DITOLAK: spoof / foto layar terdeteksi (skor real: {liveness_score:.2f})"
             self._set_last(patch)
             return
 
@@ -498,96 +574,186 @@ class Engine:
                 if frame is None:
                     return 400, {"error": "gambar tidak bisa di-decode"}
                 frame = _resize_for_detection(frame, max_dim=1280)
-                details = self.detector.detect_detailed(frame)
-                accepted = [d for d in details if d["accepted"]]
-                if not accepted:
-                    accepted = [d for d in details if d["score"] >= 0.5]
-                if not accepted:
-                    return 404, {"error": "tidak ada wajah terdeteksi untuk ekstraksi CV"}
+                # 100% Classical Computer Vision: Haar Cascade (Viola-Jones)
+                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                haar_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                face_cascade = cv2.CascadeClassifier(haar_xml)
+                faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+                if len(faces) == 0:
+                    h_img, w_img = frame.shape[:2]
+                    if h_img <= 220 and w_img <= 220:
+                        bx, by, bw, bh = 0, 0, w_img, h_img
+                        face_crop = frame
+                    else:
+                        return 404, {"error": "tidak ada wajah terdeteksi untuk ekstraksi CV (Haar Cascade)"}
+                else:
+                    bx, by, bw, bh = max(faces, key=lambda f: f[2] * f[3])
+                    h_img, w_img = frame.shape[:2]
+                    bx, by = max(0, bx), max(0, by)
+                    bw, bh = min(w_img - bx, bw), min(h_img - by, bh)
+                    face_crop = frame[by:by+bh, bx:bx+bw]
 
-                best_d = accepted[0]
-                bx, by, bw, bh = int(best_d["x"]), int(best_d["y"]), int(best_d["w"]), int(best_d["h"])
-                h_img, w_img = frame.shape[:2]
-                bx, by = max(0, bx), max(0, by)
-                bw, bh = min(w_img - bx, bw), min(h_img - by, bh)
-                face_crop = frame[by:by+bh, bx:bx+bw]
+                bbox_info = {
+                    "x": int(bx), "y": int(by), "w": int(bw), "h": int(bh),
+                    "frame_w": int(frame.shape[1]), "frame_h": int(frame.shape[0])
+                }
 
-                # Pipeline Ekstraksi Fitur Tekstur LBPH murni (tanpa skema liveness)
+                # Ekstraksi representasi visual komprehensif untuk preview tahapan (Resolusi Tinggi & Jernih)
+                ycrcb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2YCrCb)
+                cr_map = cv2.applyColorMap(ycrcb[:, :, 1], cv2.COLORMAP_JET)
+                cb_map = cv2.applyColorMap(ycrcb[:, :, 2], cv2.COLORMAP_OCEAN)
                 gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
                 equalized = cv2.equalizeHist(gray)
                 lbp_vec, lbp_img = _extract_lbp(equalized, return_image=True)
+                hist_preview_img = _render_hist_preview(lbp_vec, width=320, height=130)
 
                 pipeline_previews = [
-                    {"label": "1. ROI Crop", "image": _to_b64(face_crop)},
-                    {"label": "2. Grayscale", "image": _to_b64(gray)},
-                    {"label": "3. Equalize", "image": _to_b64(equalized)},
-                    {"label": "4. Pola LBP", "image": _to_b64(lbp_img)},
+                    {
+                        "step": 1,
+                        "label": "1. Deteksi Wajah (ROI)",
+                        "desc": "Crop Haar Cascade (Viola-Jones) fokus area wajah",
+                        "image": _to_b64(face_crop, target_size=280),
+                    },
+                    {
+                        "step": 2,
+                        "label": "2. Kanal Krominan Cr",
+                        "desc": "Kanal Cr: Pantulan Hemoglobin Kulit Asli (YCrCb)",
+                        "image": _to_b64(cr_map, target_size=280),
+                    },
+                    {
+                        "step": 3,
+                        "label": "3. Kanal Krominan Cb",
+                        "desc": "Kanal Cb: Penyerapan Melanin Kulit Asli (YCrCb)",
+                        "image": _to_b64(cb_map, target_size=280),
+                    },
+                    {
+                        "step": 4,
+                        "label": "4. Prapemrosesan Tekstur",
+                        "desc": "Grayscale + Histogram Equalization (Koreksi Kontras)",
+                        "image": _to_b64(equalized, target_size=280),
+                    },
+                    {
+                        "step": 5,
+                        "label": "5. Pola Tekstur LBP",
+                        "desc": "Local Binary Pattern (8-Tetangga, R=1, Mikro-Pori)",
+                        "image": _to_b64(lbp_img, target_size=280),
+                    },
+                    {
+                        "step": 6,
+                        "label": "6. Histogram Spasial (LBPH)",
+                        "desc": "Partisi Grid 8x8 (16.384 Dimensi Vektor Fitur)",
+                        "image": _to_b64(hist_preview_img, target_size=320),
+                    },
                 ]
 
-                # Pencocokan nyata dengan database prototype LBPH (Cosine Similarity & Chi-Square)
+                # Tahap 1: Gatekeeper 1 Liveness CV Klasik (Color Texture Analysis - Boulkenafet 2016)
+                is_real, liveness_score, c_var, sat_mean, lap_var = _check_cv_liveness(face_crop, threshold=0.52)
+                if not is_real:
+                    return 403, {
+                        "granted": False,
+                        "wajah": None,
+                        "mode": "cv",
+                        "metode": "Computer Vision Klasik (Haar/ROI + Color Texture Liveness + LBPH)",
+                        "liveness": False,
+                        "liveness_skor": liveness_score,
+                        "c_var_liveness": c_var,
+                        "sat_mean_liveness": sat_mean,
+                        "lap_var_liveness": lap_var,
+                        "threshold_liveness": 0.52,
+                        "catatan": f"DITOLAK: spoof terdeteksi via Color Texture (Skor: {liveness_score:.3f} < 0.520, C_var: {c_var:.1f}, Sat: {sat_mean:.1f})",
+                        "bbox": bbox_info,
+                        "previews": pipeline_previews,
+                        "tahapan": [
+                            "1. Akuisisi Gambar dari Kamera HP / Upload",
+                            "2. Deteksi & Cropping Region of Interest (Haar Cascade / Viola-Jones)",
+                            f"3. Gatekeeper 1 Liveness: Color Texture Analysis (YCrCb + HSV) -> SPOOF TERDETEKSI (Skor={liveness_score:.3f} < 0.520, C_var={c_var:.1f}, Sat={sat_mean:.1f})",
+                            "4. Akses DITOLAK: Terindikasi serangan pemalsuan fisik (Layar HP / Cetak)",
+                        ],
+                    }
+
+                # Tahap 2: Pencocokan dengan database prototype LBPH (Multi-Exemplar 1-NN Chi-Square & Cosine)
                 lbph_path = self.store.dir / "faces_lbph.json"
                 best_name = None
                 best_dist = 999.0
-                best_sim = 0.0
+                best_cos = 0.0
                 all_distances = {}
+                norm_vec = np.linalg.norm(lbp_vec)
 
                 if lbph_path.exists():
                     import json
                     try:
                         lbph_db = json.loads(lbph_path.read_text(encoding="utf-8"))
-                        vec_norm = lbp_vec / (np.linalg.norm(lbp_vec) + 1e-7)
                         for person, data in lbph_db.items():
-                            proto_vec = np.asarray(data["histogram"], dtype=np.float32)
-                            proto_norm = proto_vec / (np.linalg.norm(proto_vec) + 1e-7)
-                            cos_sim = float(np.dot(vec_norm, proto_norm))
-                            chi2 = float(0.5 * np.sum(((lbp_vec - proto_vec) ** 2) / (lbp_vec + proto_vec + 1e-7)))
+                            ex_list = data.get("exemplars")
+                            if ex_list:
+                                ex_arr = np.asarray(ex_list, dtype=np.float32)
+                                diff = (ex_arr - lbp_vec) ** 2
+                                denom = ex_arr + lbp_vec + 1e-7
+                                chi2_vals = 0.5 * np.sum(diff / denom, axis=1)
+                                chi2 = float(np.min(chi2_vals))
+                                dot = np.dot(ex_arr, lbp_vec)
+                                norms = np.linalg.norm(ex_arr, axis=1) * (norm_vec + 1e-7)
+                                cos_sim = float(np.max(dot / (norms + 1e-7)))
+                            else:
+                                proto_vec = np.asarray(data.get("prototype", data.get("histogram", [])), dtype=np.float32)
+                                chi2 = float(0.5 * np.sum(((lbp_vec - proto_vec) ** 2) / (lbp_vec + proto_vec + 1e-7)))
+                                cos_sim = float(np.dot(proto_vec, lbp_vec) / (np.linalg.norm(proto_vec) * (norm_vec + 1e-7) + 1e-7))
                             all_distances[person] = round(chi2, 2)
-                            if cos_sim > best_sim:
-                                best_sim = cos_sim
-                                best_name = person
+                            if chi2 < best_dist:
                                 best_dist = chi2
+                                best_name = person
+                                best_cos = cos_sim
                     except Exception as err:
                         print(f"[engine] lbph matching error: {err}")
 
-                # Threshold Kesesuaian LBPH:
-                # Sim >= 0.50 & Chi-Square <= 25.0: Wajah dikenali
-                lbph_threshold = 25.0
-                granted = bool(best_name and best_sim >= 0.50 and best_dist <= lbph_threshold)
+                # Threshold Kesesuaian LBPH Murni Terkalibrasi (Sesuai Poster Ilmiah):
+                # Normalisasi per-sel = best_dist / 64 (tabel poster: 0.27 - 0.51 penghuni, 2.86 ditolak)
+                lbph_threshold = 34.0
+                chi2_norm = round(float(best_dist / 64.0), 3)
+                cos_sim_val = round(float(best_cos), 3)
+                granted = bool(best_name and best_dist <= lbph_threshold and cos_sim_val >= 0.45)
 
-                confidence = max(0.0, min(1.0, best_sim))
+                # Skor kesesuaian ternormalisasi
+                score_ratio = max(0.0, min(1.0, 1.0 - (best_dist / (lbph_threshold * 1.5)) + (cos_sim_val * 0.3)))
+                confidence = round(score_ratio, 3)
                 wajah_result = best_name if granted else None
                 catatan = (
-                    f"Dikenali via LBPH: {best_name} (Kesesuaian: {best_sim*100:.1f}%, Chi2: {best_dist:.2f})"
+                    f"Dikenali via LBPH: {best_name} (Chi2: {best_dist:.2f} <= {lbph_threshold}, Chi2_norm: {chi2_norm:.2f}, Cosine: {cos_sim_val:.2f})"
                     if granted
-                    else f"LBPH: Tidak Dikenal (Kesesuaian: {best_sim*100:.1f}%, Chi2: {best_dist:.2f})"
+                    else f"LBPH: Tidak Dikenal (Chi2: {best_dist:.2f} > {lbph_threshold}, Chi2_norm: {chi2_norm:.2f})"
                 )
 
                 return 200, {
                     "granted": granted,
                     "wajah": wajah_result,
                     "mode": "cv",
-                    "metode": "Computer Vision Klasik (Haar/ROI + EqualizeHist + LBPH)",
+                    "metode": "Computer Vision Klasik (Haar/ROI + Color Texture Liveness + LBPH)",
                     "liveness": True,
-                    "liveness_skor": 1.0,
+                    "liveness_skor": liveness_score,
+                    "c_var_liveness": c_var,
+                    "sat_mean_liveness": sat_mean,
+                    "lap_var_liveness": lap_var,
+                    "threshold_liveness": 0.52,
                     "skor": round(confidence, 3),
                     "distance_chi2": round(best_dist, 2),
+                    "chi2_normalized": chi2_norm,
+                    "cosine_similarity": cos_sim_val,
                     "threshold_chi2": lbph_threshold,
+                    "threshold_chi2_norm": 0.53,
                     "semua_jarak": all_distances,
                     "dimensi_vektor": int(len(lbp_vec)),
                     "tahapan": [
-                        "1. Akuisisi Gambar dari Kamera HP",
-                        "2. Deteksi & Cropping Region of Interest (ROI Wajah)",
-                        "3. Prapemrosesan: Grayscale & Histogram Equalization",
-                        "4. Segmentasi Spasial Wajah (Partisi Grid 8x8)",
-                        "5. Ekstraksi Pola Tekstur LBP (8-Tetangga Radius 1)",
-                        f"6. Pencocokan Jarak Chi-Square (Jarak Terkecil: {best_dist:.2f} <= {lbph_threshold})"
+                        "1. Akuisisi Gambar dari Kamera HP / Upload",
+                        "2. Deteksi & Cropping Region of Interest (Haar Cascade / Viola-Jones)",
+                        f"3. Gatekeeper 1 Liveness: Color Texture Analysis (YCrCb + HSV) (Skor={liveness_score:.3f} >= 0.520, C_var={c_var:.1f}, Sat={sat_mean:.1f} - REAL)",
+                        "4. Prapemrosesan Tekstur: Grayscale & Histogram Equalization",
+                        "5. Segmentasi Spasial Citra (Partisi Grid 8x8)",
+                        "6. Ekstraksi Pola Tekstur LBP (8-Tetangga Radius 1, 16.384 dimensi)",
+                        f"7. Gatekeeper 2 Identitas: Pencocokan Dual Metrik (Chi2_norm: {chi2_norm:.2f} vs Ambang 0.53, Cosine: {cos_sim_val:.2f})"
                     ],
                     "catatan": catatan,
                     "previews": pipeline_previews,
-                    "bbox": {
-                        "x": bx, "y": by, "w": bw, "h": bh,
-                        "frame_w": int(frame.shape[1]), "frame_h": int(frame.shape[0])
-                    },
+                    "bbox": bbox_info,
                 }
             except Exception as exc:
                 return 500, {"error": f"ekstraksi CV gagal: {exc}"}
@@ -622,11 +788,23 @@ class Engine:
                 "frame_h": int(frame.shape[0]),
             }
 
-            # Liveness
+            # Liveness: MiniFASNet + MCTA Guard
             is_real, liveness_score = True, 1.0
+            catatan_spoof = "DITOLAK: spoof / wajah palsu terdeteksi"
             if self.fas.ready:
                 is_real, liveness_score, _ = self.fas.check(frame, box0)
                 is_real = bool(is_real and liveness_score >= self.store.fas_threshold())
+
+            # Color Texture Guard: tangkal serangan layar smartphone (OLED/AMOLED)
+            if is_real:
+                bx, by, bw, bh = box0
+                patch_crop = frame[max(0, by):min(frame.shape[0], by + bh), max(0, bx):min(frame.shape[1], bx + bw)]
+                if patch_crop.size > 0:
+                    is_real_mcta, mcta_score, c_var, _, _ = _check_cv_liveness(patch_crop, threshold=0.50)
+                    if not is_real_mcta:
+                        is_real = False
+                        liveness_score = round(float(mcta_score), 3)
+                        catatan_spoof = f"DITOLAK: spoof layar HP/cetak terdeteksi via Color Texture (Skor: {mcta_score:.3f}, C_var: {c_var:.1f})"
 
             if not is_real:
                 return 403, {
@@ -634,7 +812,7 @@ class Engine:
                     "wajah": None,
                     "liveness": False,
                     "liveness_skor": round(float(liveness_score), 3),
-                    "catatan": "DITOLAK: spoof / wajah palsu terdeteksi",
+                    "catatan": catatan_spoof,
                     "bbox": bbox_info,
                 }
 

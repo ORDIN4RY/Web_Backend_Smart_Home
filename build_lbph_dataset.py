@@ -1,69 +1,113 @@
 """
 build_lbph_dataset.py — Ekstrak prototype LBPH dari folder foto dataset.
+Menggunakan 100% Classical Computer Vision: Haar Cascade Classifier (Viola-Jones).
 Jalankan:
   python build_lbph_dataset.py "path/ke/folder_dataset"
 """
 
 import sys
+import os
 import glob
 import json
 import cv2
 import numpy as np
-from core.detector import Detector
 from core.engine import _extract_lbp, _resize_for_detection
 
 
-def build_lbph_dataset(dataset_dir: str, output_file: str = "api_data/faces_lbph.json"):
-    detector = Detector("face_detection_yunet_2023mar.onnx")
-    db = {}
+def build_lbph_dataset(dataset_dir: str = ".", output_file: str = "api_data/faces_lbph.json"):
+    # Detektor Klasik Haar Cascade (Viola-Jones)
+    xml_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    face_cascade = cv2.CascadeClassifier(xml_path)
+    if face_cascade.empty():
+        raise RuntimeError(f"Gagal memuat Haar Cascade dari: {xml_path}")
 
-    for folder in glob.glob(f"{dataset_dir}/*"):
+    db = {}
+    color_samples = []
+    EXCLUDE = ["spoof", "dataset_unknown", "__pycache__", ".ipynb_checkpoints", "models", "mobilefacenet", "fas", "api_data", "core", "routes"]
+
+    for folder in sorted(glob.glob(f"{dataset_dir}/*")):
+        if not os.path.isdir(folder):
+            continue
         name = folder.replace("\\", "/").rstrip("/").split("/")[-1]
-        if name.lower() in ["spoof", "__pycache__"]:
+        if name.lower() in EXCLUDE:
             continue
 
-        images = glob.glob(f"{folder}/*.jpg") + glob.glob(f"{folder}/*.jpeg") + glob.glob(f"{folder}/*.png")
-        vecs = []
+        images = sorted(glob.glob(f"{folder}/*.jpg") + glob.glob(f"{folder}/*.jpeg") + glob.glob(f"{folder}/*.png"))
+        if not images:
+            continue
 
-        for p in images:
-            frame = cv2.imread(p)
+        print(f"Memproses {name} ({len(images)} gambar)...")
+        histograms = []
+
+        for img_path in images:
+            frame = cv2.imread(img_path)
             if frame is None:
                 continue
-            frame = _resize_for_detection(frame, max_dim=1280)
-            details = detector.detect_detailed(frame)
-            accepted = [d for d in details if d.get("accepted") or d.get("score", 0) >= 0.5]
-            if not accepted:
-                continue
 
-            best_d = accepted[0]
-            bx, by, bw, bh = int(best_d["x"]), int(best_d["y"]), int(best_d["w"]), int(best_d["h"])
-            h_img, w_img = frame.shape[:2]
-            bx, by = max(0, bx), max(0, by)
-            bw, bh = min(w_img - bx, bw), min(h_img - by, bh)
+            frame = _resize_for_detection(frame, max_dim=640)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+            if len(faces) == 0:
+                h_img, w_img = frame.shape[:2]
+                if h_img <= 220 and w_img <= 220:
+                    face_crop = frame
+                else:
+                    continue
+            else:
+                bx, by, bw, bh = max(faces, key=lambda f: f[2] * f[3])
+                h_img, w_img = frame.shape[:2]
+                if h_img <= 220 and w_img <= 220:
+                    # Sudah merupakan potongan wajah standar (112x112)
+                    face_crop = frame
+                else:
+                    face_crop = frame[max(0, by):by+bh, max(0, bx):bx+bw]
+            face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+            equalized = cv2.equalizeHist(face_gray)
+            features = _extract_lbp(equalized)
+            histograms.append(features)
 
-            face_crop = frame[by:by+bh, bx:bx+bw]
-            if face_crop.size == 0:
-                continue
+            # Ekstrak Color-LBP Cr+Cb untuk Liveness Prototype (Boulkenafet et al., IEEE TIFS 2016)
+            ycrcb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2YCrCb)
+            h_cr = _extract_lbp(ycrcb[:, :, 1], grid_x=1, grid_y=1)
+            h_cb = _extract_lbp(ycrcb[:, :, 2], grid_x=1, grid_y=1)
+            color_samples.append(np.concatenate([h_cr, h_cb]))
 
-            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-            eq = cv2.equalizeHist(gray)
-            vecs.append(_extract_lbp(eq))
+        if histograms:
+            # 1. Simpan K=25 exemplar nyata untuk pencocokan Multi-Exemplar 1-NN
+            num_ex = min(25, len(histograms))
+            step = len(histograms) / num_ex
+            ex_indices = [int(i * step) for i in range(num_ex)]
+            exemplars = [histograms[i].tolist() for i in ex_indices]
 
-        if vecs:
-            proto = np.mean(vecs, axis=0)
+            # 2. Vektor medoid pusat untuk fallback backward-compatibility
+            hist_matrix = np.asarray(histograms, dtype=np.float32)
+            mean_vec = np.mean(hist_matrix, axis=0)
+            diffs = np.sum((hist_matrix - mean_vec) ** 2, axis=1)
+            medoid_idx = int(np.argmin(diffs))
+            central_histogram = histograms[medoid_idx].tolist()
+
             db[name] = {
-                "histogram": proto.tolist(),
-                "count": len(vecs),
-                "dim": int(len(proto)),
+                "exemplars": exemplars,
+                "histogram": central_histogram,
+                "count": len(histograms),
+                "dim": len(histograms[0])
             }
-            print(f"[LBPH] {name}: {len(vecs)} foto berhasil diekstrak")
+            print(f"  -> {name}: {len(histograms)} terdeteksi via Haar Cascade, {num_ex} exemplar disimpan.")
 
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2, ensure_ascii=False)
+        json.dump(db, f)
 
-    print(f"\nSelesai! {len(db)} profil identitas tersimpan di '{output_file}'.")
+    if color_samples:
+        color_proto = np.mean(color_samples, axis=0).tolist()
+        proto_file = os.path.join(os.path.dirname(output_file), "color_lbp_proto.json")
+        with open(proto_file, "w", encoding="utf-8") as f:
+            json.dump({"proto": color_proto, "dim": len(color_proto), "count": len(color_samples)}, f)
+        print(f"Prototipe Color-LBP Liveness disimpan di {proto_file} ({len(color_samples)} sampel).")
+
+    print(f"\nSelesai! Database LBPH Haar Cascade disimpan di {output_file} ({len(db)} profil).")
 
 
 if __name__ == "__main__":
-    target = sys.argv[1] if len(sys.argv) > 1 else "../backup testing models/dataset"
-    build_lbph_dataset(target)
+    dir_target = sys.argv[1] if len(sys.argv) > 1 else "."
+    build_lbph_dataset(dir_target)

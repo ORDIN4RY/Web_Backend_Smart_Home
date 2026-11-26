@@ -1,0 +1,19 @@
+services:
+  flask-ai:
+    build: .
+    container_name: homatix-flask-ai
+    restart: unless-stopped
+    expose:
+      - "5000"
+    volumes:
+      - flask_data:/app/api_data
+    networks:
+      - homatix-net
+
+networks:
+  homatix-net:
+    external: true
+    name: homatix-net
+
+volumes:
+  flask_data:

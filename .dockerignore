@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.ipynb
+dataset baru/
+dataset_unknown/
+Faza/
+Raffin/
+Rafi/
+spoof/
+*.csv
+*.html
+.env

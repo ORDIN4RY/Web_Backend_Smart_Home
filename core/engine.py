@@ -1,8 +1,13 @@
 """
-core/engine.py — Engine face recognition: state global + worker loop kamera.
+core/engine.py — Lean orchestrator: state global + worker loop kamera.
 
 Engine menyatukan semua komponen (Store, Detector, Recognizer, AntiSpoofChecker,
 FrameGrabber) dan menyediakan satu antarmuka bersih ke layer Routes Flask.
+
+Implementasi detail:
+  - Mode "cv"  → didelegasikan ke core.cv.pipeline.recognize_cv
+  - Mode "ai"  → didelegasikan ke core.ai.pipeline.recognize_ai
+  - Worker loop kamera tetap di sini (state global thread-safe)
 
 Ekspor utama:
   Engine        — class yang di-inisialisasi sekali saat startup aplikasi
@@ -14,10 +19,14 @@ import time
 from pathlib import Path
 
 from core.store import Store
-from core.detector import Detector
-from core.recognizer import Recognizer
-from core.anti_spoof import AntiSpoofChecker
 from core.grabber import FrameGrabber
+
+# Sistem Cerdas (Deep Learning)
+from core.ai import Detector, Recognizer, AntiSpoofChecker, recognize_frame_ai, recognize_ai
+
+# Computer Vision Klasik
+from core.cv.lbp_liveness import COLOR_LBP_REAL, COLOR_LBP_SPOOF, COLOR_LBP_THRESH
+from core.cv.lbph import extract_lbp, recognize_cv
 
 
 def _now_iso():
@@ -25,181 +34,20 @@ def _now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
-def _resize_for_detection(frame, max_dim: int = 1280):
+def _parse_source(raw) -> tuple:
     """
-    Resize frame agar sisi terpanjang tidak melebihi max_dim.
-    YuNet perlu gambar yang tidak terlalu besar (foto HP bisa 3-12 MP).
-    Kembalikan frame yang sudah di-resize (atau asli jika sudah kecil).
+    'none' -> (None, 'none')
+    '0'    -> (0, '0')      (webcam indeks)
+    'http://...' -> (url, url)
     """
-    import cv2
-    h, w = frame.shape[:2]
-    if max(h, w) <= max_dim:
-        return frame
-    scale = max_dim / max(h, w)
-    new_w, new_h = int(w * scale), int(h * scale)
-    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
-
-def _extract_lbp(gray_crop, grid_x=8, grid_y=8, return_image=False):
-    """
-    Ekstraksi fitur Local Binary Pattern (LBP) murni NumPy tanpa pretrained model.
-    Menghasilkan histogram spasial grid_x * grid_y * 256 dimensi.
-    """
-    import cv2
-    import numpy as np
-    gray = cv2.resize(gray_crop, (100, 100))
-    center = gray[1:-1, 1:-1]
-    lbp = np.zeros_like(center, dtype=np.uint8)
-    shifts = [
-        (-1, -1, 0), (-1, 0, 1), (-1, 1, 2),
-        (0, 1, 3),   (1, 1, 4),  (1, 0, 5),
-        (1, -1, 6),  (0, -1, 7)
-    ]
-    for dy, dx, bit in shifts:
-        neighbor = gray[1+dy:99+dy, 1+dx:99+dx]
-        lbp |= ((neighbor >= center).astype(np.uint8) << bit)
-
-    hists = []
-    for r in np.array_split(lbp, grid_y, axis=0):
-        for c in np.array_split(r, grid_x, axis=1):
-            h, _ = np.histogram(c, bins=256, range=(0, 256))
-            h = h.astype(np.float32)
-            h /= (h.sum() + 1e-7)
-            hists.append(h)
-    vec = np.concatenate(hists)
-    return (vec, lbp) if return_image else vec
-
-
-def _to_b64(img, target_size=260, quality=88):
-    """
-    Encode citra ke base64 JPEG resolusi tinggi & jernih untuk UI.
-    Mempertahankan aspect ratio dan menskalakan agar tajam & tidak kecil/buram.
-    """
-    import base64
-    import cv2
-    if img is None or img.size == 0:
-        return ""
-    h, w = img.shape[:2]
-    if max(h, w) > target_size:
-        scale = target_size / max(h, w)
-        resized = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-    elif max(h, w) < 180:
-        scale = 220 / max(h, w)
-        resized = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_NEAREST)
-    else:
-        resized = img
-    _, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    return base64.b64encode(buf).decode("ascii")
-
-
-def _render_hist_preview(vec, width=320, height=130):
-    """Render kurva visualisasi profil histogram LBPH (OpenCV murni tanpa overhead)."""
-    import cv2
-    import numpy as np
-    canvas = np.full((height, width, 3), 248, dtype=np.uint8)  # Background abu-abu muda
-    bins = 64
-    chunk = max(1, len(vec) // bins)
-    sampled = [float(np.mean(vec[i * chunk:(i + 1) * chunk])) for i in range(bins)]
-    max_v = max(sampled) if max(sampled) > 0 else 1.0
-    bar_w = max(1, width // bins)
-    for i, v in enumerate(sampled):
-        h_bar = int((v / max_v) * (height - 24))
-        x1 = i * bar_w
-        x2 = min(width - 1, (i + 1) * bar_w - 1)
-        y2 = height - 10
-        y1 = max(10, y2 - h_bar)
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), (180, 80, 50), -1)  # Steelblue
-    cv2.rectangle(canvas, (0, 0), (width - 1, height - 1), (190, 190, 190), 1)
-    return canvas
-
-
-def _load_color_lbp_proto():
-    """Muat galeri Multi-Exemplar Color-LBP (Real & Spoof) untuk liveness detection (1-NN Chi-Square)."""
-    import json
-    from pathlib import Path
-    import numpy as np
-
-    proto_path = Path(__file__).resolve().parent.parent / "api_data" / "color_lbp_proto.json"
-    if proto_path.exists():
-        try:
-            data = json.loads(proto_path.read_text(encoding="utf-8"))
-            th = float(data.get("threshold", 0.08))
-            real_ex = data.get("real_exemplars", data.get("exemplars", []))
-            spoof_ex = data.get("spoof_exemplars", [])
-            real_mat = np.asarray(real_ex, dtype=np.float32) if len(real_ex) > 0 else None
-            spoof_mat = np.asarray(spoof_ex, dtype=np.float32) if len(spoof_ex) > 0 else None
-            return real_mat, spoof_mat, th
-        except Exception as err:
-            print(f"[engine] error loading color_lbp_proto.json: {err}")
-    return None, None, 0.08
-
-
-_COLOR_LBP_REAL, _COLOR_LBP_SPOOF, _COLOR_LBP_THRESH = _load_color_lbp_proto()
-
-
-def _check_cv_liveness(face_bgr, threshold: float = None):
-    """
-    Gatekeeper 1: Multi-Color Space Chrominance LBP (YCrCb + HSV: Cr, Cb, H, S -> 1024-D).
-    Murni Pengolahan Citra Digital Klasik Multi-Exemplar 1-NN (Boulkenafet et al., IEEE TIFS 2016):
-      - YCrCb (Cr, Cb): Mendeteksi pantulan spektral hemoglobin & melanin kulit asli
-      - HSV (H, S): Hue kebal terhadap intensitas lampu, Saturation mendeteksi over-saturation layar HP
-      - Kanal luminansi (Y, V) dibuang total agar tidak terpengaruh perbedaan gelap/terang kamera HP
-      - Keputusan Liveness: 1-NN Relatif Murni (d_real < d_spoof)
-    """
-    import cv2
-    import numpy as np
-
-    if face_bgr is None or face_bgr.size == 0:
-        return False, 0.0, 1.0, 0.0
-
-    if threshold is None:
-        threshold = _COLOR_LBP_THRESH
-
-    face = cv2.resize(face_bgr, (128, 128))
-    ycrcb = cv2.cvtColor(face, cv2.COLOR_BGR2YCrCb)
-    hsv = cv2.cvtColor(face, cv2.COLOR_BGR2HSV)
-
-    # Ekstraksi Color-LBP pada 4 kanal krominans (YCrCb: Cr, Cb + HSV: H, S) -> Total 1024 dimensi
-    # Membuang kanal luminansi (Y dan V) agar kebal 100% terhadap variasi terang/gelap pencahayaan HP
-    h_cr = _extract_lbp(ycrcb[:, :, 1], grid_x=1, grid_y=1)
-    h_cb = _extract_lbp(ycrcb[:, :, 2], grid_x=1, grid_y=1)
-    h_h = _extract_lbp(hsv[:, :, 0], grid_x=1, grid_y=1)
-    h_s = _extract_lbp(hsv[:, :, 1], grid_x=1, grid_y=1)
-    vec = np.concatenate([h_cr, h_cb, h_h, h_s]).astype(np.float32)
-
-    # 1. Jarak ke galeri Wajah Asli (Real)
-    if _COLOR_LBP_REAL is not None:
-        if _COLOR_LBP_REAL.ndim == 2:
-            diff_r = (_COLOR_LBP_REAL - vec) ** 2
-            denom_r = _COLOR_LBP_REAL + vec + 1e-7
-            d_real = float(np.min(0.5 * np.sum(diff_r / denom_r, axis=1)))
-        else:
-            diff_r = (vec - _COLOR_LBP_REAL) ** 2
-            denom_r = vec + _COLOR_LBP_REAL + 1e-7
-            d_real = float(0.5 * np.sum(diff_r / denom_r))
-    else:
-        d_real = 0.50
-
-    # 2. Jarak ke galeri Serangan Palsu (Spoof)
-    if _COLOR_LBP_SPOOF is not None and len(_COLOR_LBP_SPOOF) > 0:
-        diff_s = (_COLOR_LBP_SPOOF - vec) ** 2
-        denom_s = _COLOR_LBP_SPOOF + vec + 1e-7
-        d_spoof = float(np.min(0.5 * np.sum(diff_s / denom_s, axis=1)))
-    else:
-        d_spoof = 999.0
-
-    # Wajah adalah REAL jika secara komparatif lebih dekat ke galeri Real daripada galeri Spoof (1-NN Relatif Murni)
-    is_real = bool(d_real < d_spoof)
-
-    # Skor liveness normalisasi (0.0 s.d 1.0) berbasis margin komparasi (d_spoof vs d_real)
-    margin_ratio = (d_spoof - d_real) / (d_spoof + d_real + 1e-7)
-    liveness_score = round(float(max(0.0, min(1.0, 0.5 + 0.5 * margin_ratio))), 3)
-
-    return is_real, liveness_score, round(d_real, 4), round(d_spoof, 4)
+    if raw is None:
+        return None, "none"
+    text = str(raw).strip()
+    if text.lower() == "none" or text == "":
+        return None, "none"
+    if text.isdigit():
+        return int(text), text
+    return text, text
 
 
 class Engine:
@@ -241,9 +89,13 @@ class Engine:
         self.source, self.source_label = _parse_source(source_raw)
 
         self.grabber = FrameGrabber(self.source)
+
+        # Detektor YuNet (Sistem Cerdas — dipakai juga oleh CV pipeline sebagai fallback)
         self.detector = Detector(
             cfg.get("yunet_model", "face_detection_yunet_2023mar.onnx")
         )
+
+        # Recognizer SFace/MFN (Sistem Cerdas)
         self.recognizer = Recognizer(
             sface_model=cfg.get("sface_model", "models/face_recognition_sface_2021dec.onnx"),
             backend=cfg.get("model_backend", self.store.config.get("model_backend", "sface")),
@@ -251,10 +103,17 @@ class Engine:
             mfn_repo=cfg.get("mfn_repo", "MobileFaceNet"),
             pretrained=cfg.get("pretrained", "MobileFaceNet/weights/mobilefacenet.pt"),
         )
+
+        # Anti-spoof MiniFASNet (Sistem Cerdas)
         self.fas = AntiSpoofChecker(
             model_dir=cfg.get("fas_model_dir", "fas/models"),
             threshold=self.store.fas_threshold(),
         )
+
+        # Galeri Color-LBP (Computer Vision Klasik) — dimuat saat import core.cv.lbp_liveness
+        self._clbp_real = COLOR_LBP_REAL
+        self._clbp_spoof = COLOR_LBP_SPOOF
+        self._clbp_thresh = COLOR_LBP_THRESH
 
         # --- State hasil recognition terakhir ---
         self._lock = threading.Lock()
@@ -305,10 +164,10 @@ class Engine:
             # Detektor
             "detektor": self.detector.kind,
             "detektor_alasan": self.detector.reason or None,
-            # Model recognition
+            # Model recognition (Sistem Cerdas)
             "model": "dimuat" if self.recognizer.ready else "belum_dimuat",
             "model_alasan": self.recognizer.reason or None,
-            # Anti-spoof
+            # Anti-spoof (Sistem Cerdas)
             "fas_model": "dimuat" if self.fas.ready else "belum_dimuat",
             "fas_alasan": self.fas.reason or None,
             # Hasil recognition terakhir
@@ -346,98 +205,40 @@ class Engine:
             self._process_frame(frame)
 
     def _process_frame(self, frame):
-        """Jalankan deteksi + liveness + recognition pada satu frame."""
+        """Jalankan deteksi + liveness + recognition AI pada satu frame kamera."""
         try:
-            details = self.detector.detect_detailed(frame)
-            accepted = [d for d in details if d["accepted"]]
-            boxes = [(d["x"], d["y"], d["w"], d["h"]) for d in accepted]
+            res = recognize_frame_ai(
+                frame,
+                detector=self.detector,
+                recognizer=self.recognizer,
+                fas=self.fas,
+                store=self.store,
+                real_mat=self._clbp_real,
+                spoof_mat=self._clbp_spoof,
+                lbp_thresh=self._clbp_thresh,
+            )
         except Exception as exc:
             self._set_last({"waktu": _now_iso(), "catatan": f"deteksi gagal: {exc}"})
             return
 
-        patch = {
+        accepted = res["accepted"]
+        boxes = [[d["x"], d["y"], d["w"], d["h"]] for d in accepted]
+        catatan = res["catatan"]
+        if res["status"] == "ok" and res["granted"]:
+            catatan = f"{catatan} (REAL)"
+
+        self._set_last({
             "waktu": _now_iso(),
             "jumlah_box": len(boxes),
-            "boxes": [list(b) for b in boxes],
+            "boxes": boxes,
             "landmarks": [d.get("landmarks") for d in accepted if d.get("landmarks")],
-            "wajah": None,
-            "skor": None,
-            "liveness": None,
-            "liveness_skor": None,
-            "granted": False,
-        }
-
-        if not boxes:
-            patch["catatan"] = "tidak ada wajah di frame"
-            self._set_last(patch)
-            return
-
-        if not self.recognizer.ready:
-            patch["catatan"] = f"wajah terdeteksi, model belum dimuat: {self.recognizer.reason}"
-            self._set_last(patch)
-            return
-
-        best_d = accepted[0]
-        box0 = (best_d["x"], best_d["y"], best_d["w"], best_d["h"])
-
-        # Tahap 1: Liveness (MiniFASNet + MCTA Guard)
-        is_real, liveness_score = True, 1.0
-        if self.fas.ready:
-            is_real, liveness_score, _ = self.fas.check(frame, box0)
-            is_real = bool(is_real and liveness_score >= self.store.fas_threshold())
-
-        # Color-LBP Guard: tangkal serangan layar smartphone (OLED/AMOLED) yang lolos dari MiniFASNet
-        if is_real:
-            bx, by, bw, bh = box0
-            patch_crop = frame[max(0, by):min(frame.shape[0], by + bh), max(0, bx):min(frame.shape[1], bx + bw)]
-            if patch_crop.size > 0:
-                is_real_clbp, clbp_score, chi2_live, *rest = _check_cv_liveness(patch_crop, threshold=_COLOR_LBP_THRESH)
-                if not is_real_clbp:
-                    is_real = False
-                    liveness_score = round(float(clbp_score), 3)
-
-        patch["liveness"] = is_real
-        patch["liveness_skor"] = round(float(liveness_score), 3)
-
-        if not is_real:
-            patch["granted"] = False
-            patch["catatan"] = f"DITOLAK: spoof / foto layar terdeteksi (skor real: {liveness_score:.2f})"
-            self._set_last(patch)
-            return
-
-        # Tahap 2: Recognition
-        faces = self.store.prototypes()
-        if not faces:
-            patch["catatan"] = "wajah REAL, belum ada wajah terdaftar"
-            self._set_last(patch)
-            return
-
-        try:
-            emb = self.recognizer.embedding_from_frame(
-                frame, box0,
-                landmarks=best_d.get("landmarks"),
-                raw=best_d.get("raw"),
-                margin=self.store.margin(),
-            )
-            if emb is None:
-                patch["catatan"] = "crop terlalu kecil, dilewati"
-            else:
-                name, score = Recognizer.best_match(emb, faces)
-                granted = score >= self.store.threshold()
-                patch.update({
-                    "wajah": name if granted else None,
-                    "skor": round(score, 3),
-                    "granted": granted,
-                    "catatan": (
-                        f"dikenali: {name} (REAL)"
-                        if granted
-                        else "wajah REAL, skor di bawah threshold (unknown)"
-                    ),
-                })
-        except Exception as exc:
-            patch["catatan"] = f"recognition gagal: {exc}"
-
-        self._set_last(patch)
+            "wajah": res["wajah"],
+            "skor": res["skor"],
+            "liveness": res["liveness"],
+            "liveness_skor": res["liveness_skor"],
+            "granted": res["granted"],
+            "catatan": catatan,
+        })
 
     # ------------------------------------------------------------------
     # Enroll dari kamera live
@@ -518,11 +319,13 @@ class Engine:
                 return 400, {"error": "gambar tidak bisa di-decode"}
 
             # Resize ke max 1280px agar YuNet bisa deteksi wajah di foto HP resolusi tinggi
-            frame = _resize_for_detection(frame, max_dim=1280)
+            h_f, w_f = frame.shape[:2]
+            if max(h_f, w_f) > 1280:
+                scale = 1280 / max(h_f, w_f)
+                frame = cv2.resize(frame, (int(w_f * scale), int(h_f * scale)), interpolation=cv2.INTER_AREA)
 
-            # Deteksi wajah di foto
+            # Deteksi wajah di foto (Sistem Cerdas: YuNet)
             details = self.detector.detect_detailed(frame)
-            # Enroll pakai semua detektor (strict_geometry=False lebih cocok untuk foto)
             accepted = [d for d in details if d["accepted"]]
             if not accepted:
                 # Coba tanpa filter geometri: gunakan box penuh
@@ -548,19 +351,22 @@ class Engine:
             if emb is None:
                 return 400, {"error": "crop wajah terlalu kecil"}
 
+            # Simpan prototype AI (Sistem Cerdas: SFace embedding)
             self.store.set_face(nama, emb, 1)
 
-            # Juga simpan prototype LBPH untuk mode Computer Vision
+            # Simpan prototype LBPH untuk mode Computer Vision Klasik
             try:
                 bx, by, bw, bh = int(box0[0]), int(box0[1]), int(box0[2]), int(box0[3])
                 h_f, w_f = frame.shape[:2]
                 bx, by = max(0, bx), max(0, by)
                 bw, bh = min(w_f - bx, bw), min(h_f - by, bh)
-                face_crop_enroll = frame[by:by+bh, bx:bx+bw]
+                face_crop_enroll = frame[by:by + bh, bx:bx + bw]
                 if face_crop_enroll.size > 0:
-                    gray_crop = cv2.cvtColor(face_crop_enroll, cv2.COLOR_BGR2GRAY)
+                    gray_crop = cv2.resize(
+                        cv2.cvtColor(face_crop_enroll, cv2.COLOR_BGR2GRAY), (100, 100)
+                    )
                     eq_crop = cv2.equalizeHist(gray_crop)
-                    lbp_hist = _extract_lbp(eq_crop)
+                    lbp_hist = extract_lbp(eq_crop)
                     self.store.set_face_lbph(nama, lbp_hist)
             except Exception as e_lbp:
                 print(f"[engine] enroll lbph warning: {e_lbp}")
@@ -580,288 +386,30 @@ class Engine:
     def recognize_photo(self, image_bytes: bytes, mode: str = "ai") -> tuple:
         """
         Kenali wajah dari foto yang diupload oleh aplikasi mobile.
-        mode: "ai" (Sistem Cerdas: YuNet + SFace) atau "cv" (Computer Vision: Haar/ROI + LBPH)
-        Kembalikan (http_code, payload_dict).
+        mode: "ai" (Sistem Cerdas) atau "cv" (Computer Vision Klasik)
+        Didelegasikan ke core.cv.pipeline atau core.ai.pipeline.
         """
         if mode == "cv":
-            # Mode Computer Vision: Grayscale -> Crop -> EqualizeHist -> LBPH extraction
-            try:
-                import numpy as np
-                import cv2
-                arr = np.frombuffer(image_bytes, np.uint8)
-                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if frame is None:
-                    return 400, {"error": "gambar tidak bisa di-decode"}
-                frame = _resize_for_detection(frame, max_dim=1280)
-                # 100% Classical Computer Vision: Haar Cascade (Viola-Jones)
-                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                haar_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-                face_cascade = cv2.CascadeClassifier(haar_xml)
-                faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-                if len(faces) == 0:
-                    h_img, w_img = frame.shape[:2]
-                    if h_img <= 220 and w_img <= 220:
-                        bx, by, bw, bh = 0, 0, w_img, h_img
-                        face_crop = frame
-                    else:
-                        return 404, {"error": "tidak ada wajah terdeteksi untuk ekstraksi CV (Haar Cascade)"}
-                else:
-                    bx, by, bw, bh = max(faces, key=lambda f: f[2] * f[3])
-                    h_img, w_img = frame.shape[:2]
-                    bx, by = max(0, bx), max(0, by)
-                    bw, bh = min(w_img - bx, bw), min(h_img - by, bh)
-                    face_crop = frame[by:by+bh, bx:bx+bw]
-
-                bbox_info = {
-                    "x": int(bx), "y": int(by), "w": int(bw), "h": int(bh),
-                    "frame_w": int(frame.shape[1]), "frame_h": int(frame.shape[0])
-                }
-
-                # Ekstraksi representasi visual komprehensif untuk preview tahapan (Resolusi Tinggi & Jernih)
-                ycrcb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2YCrCb)
-                cr_map = cv2.applyColorMap(ycrcb[:, :, 1], cv2.COLORMAP_JET)
-                cb_map = cv2.applyColorMap(ycrcb[:, :, 2], cv2.COLORMAP_OCEAN)
-                gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-                equalized = cv2.equalizeHist(gray)
-                lbp_vec, lbp_img = _extract_lbp(equalized, return_image=True)
-                hist_preview_img = _render_hist_preview(lbp_vec, width=320, height=130)
-
-                pipeline_previews = [
-                    {
-                        "step": 1,
-                        "label": "1. Deteksi Wajah (ROI)",
-                        "desc": "Crop Haar Cascade (Viola-Jones) fokus area wajah",
-                        "image": _to_b64(face_crop, target_size=280),
-                    },
-                    {
-                        "step": 2,
-                        "label": "2. Kanal Krominan Cr",
-                        "desc": "Kanal Cr: Pantulan Hemoglobin Kulit Asli (YCrCb)",
-                        "image": _to_b64(cr_map, target_size=280),
-                    },
-                    {
-                        "step": 3,
-                        "label": "3. Kanal Krominan Cb",
-                        "desc": "Kanal Cb: Penyerapan Melanin Kulit Asli (YCrCb)",
-                        "image": _to_b64(cb_map, target_size=280),
-                    },
-                    {
-                        "step": 4,
-                        "label": "4. Prapemrosesan Tekstur",
-                        "desc": "Grayscale + Histogram Equalization (Koreksi Kontras)",
-                        "image": _to_b64(equalized, target_size=280),
-                    },
-                    {
-                        "step": 5,
-                        "label": "5. Pola Tekstur LBP",
-                        "desc": "Local Binary Pattern (8-Tetangga, R=1, Mikro-Pori)",
-                        "image": _to_b64(lbp_img, target_size=280),
-                    },
-                    {
-                        "step": 6,
-                        "label": "6. Histogram Spasial (LBPH)",
-                        "desc": "Partisi Grid 8x8 (16.384 Dimensi Vektor Fitur)",
-                        "image": _to_b64(hist_preview_img, target_size=320),
-                    },
-                ]
-
-                # Tahap 1: Gatekeeper 1 Liveness CV Klasik (Multi-Exemplar 1-NN Color-LBP Chi-Square Real vs Spoof)
-                is_real, liveness_score, chi2_liveness, chi2_spoof = _check_cv_liveness(face_crop, threshold=_COLOR_LBP_THRESH)
-                if not is_real:
-                    return 403, {
-                        "granted": False,
-                        "wajah": None,
-                        "mode": "cv",
-                        "metode": "Computer Vision Klasik (Haar/ROI + Multi-Exemplar Color-LBP 1-NN + LBPH)",
-                        "liveness": False,
-                        "liveness_skor": liveness_score,
-                        "distance_chi2_liveness": chi2_liveness,
-                        "distance_chi2_spoof": chi2_spoof,
-                        "threshold_chi2_liveness": _COLOR_LBP_THRESH,
-                        "catatan": f"DITOLAK: spoof terdeteksi via Color-LBP 1-NN (χ² Real: {chi2_liveness:.3f}, χ² Spoof: {chi2_spoof:.3f})",
-                        "bbox": bbox_info,
-                        "previews": pipeline_previews,
-                        "tahapan": [
-                            "1. Akuisisi Gambar dari Kamera HP / Upload",
-                            "2. Deteksi & Cropping Region of Interest (Haar Cascade / Viola-Jones)",
-                            f"3. Gatekeeper 1 Liveness: Color-LBP 1-NN CrCb+HS 1024-D (χ² Real={chi2_liveness:.3f} >= χ² Spoof={chi2_spoof:.3f} -> SPOOF)",
-                            "4. Akses DITOLAK: Terindikasi serangan pemalsuan fisik (Layar HP / Cetak)",
-                        ],
-                    }
-
-                # Tahap 2: Pencocokan dengan database prototype LBPH (Multi-Exemplar 1-NN Chi-Square)
-                lbph_path = self.store.dir / "faces_lbph.json"
-                best_name = None
-                best_dist = 999.0
-                all_distances = {}
-
-                if lbph_path.exists():
-                    import json
-                    try:
-                        lbph_db = json.loads(lbph_path.read_text(encoding="utf-8"))
-                        for person, data in lbph_db.items():
-                            ex_list = data.get("exemplars")
-                            if ex_list:
-                                ex_arr = np.asarray(ex_list, dtype=np.float32)
-                                diff = (ex_arr - lbp_vec) ** 2
-                                denom = ex_arr + lbp_vec + 1e-7
-                                chi2_vals = 0.5 * np.sum(diff / denom, axis=1)
-                                chi2 = float(np.min(chi2_vals))
-                            else:
-                                proto_vec = np.asarray(data.get("prototype", data.get("histogram", [])), dtype=np.float32)
-                                chi2 = float(0.5 * np.sum(((lbp_vec - proto_vec) ** 2) / (lbp_vec + proto_vec + 1e-7)))
-                            all_distances[person] = round(chi2, 2)
-                            if chi2 < best_dist:
-                                best_dist = chi2
-                                best_name = person
-                    except Exception as err:
-                        print(f"[engine] lbph matching error: {err}")
-
-                # Threshold Kesesuaian LBPH Murni Terkalibrasi (Sesuai kalibrasi_threshold.ipynb):
-                # Normalisasi per-sel = best_dist / 64 (tabel poster: 0.27 - 0.51 penghuni, 2.86 ditolak)
-                lbph_threshold = 34.0
-                chi2_norm = round(float(best_dist / 64.0), 3)
-                granted = bool(best_name and best_dist <= lbph_threshold)
-
-                # Skor kesesuaian ternormalisasi
-                score_ratio = max(0.0, min(1.0, 1.0 - (best_dist / (lbph_threshold * 1.5))))
-                confidence = round(score_ratio, 3)
-                wajah_result = best_name if granted else None
-                catatan = (
-                    f"Dikenali via LBPH: {best_name} (Chi2: {best_dist:.2f} <= {lbph_threshold}, Chi2_norm: {chi2_norm:.2f})"
-                    if granted
-                    else f"LBPH: Tidak Dikenal (Chi2: {best_dist:.2f} > {lbph_threshold}, Chi2_norm: {chi2_norm:.2f})"
-                )
-
-                return 200, {
-                    "granted": granted,
-                    "wajah": wajah_result,
-                    "mode": "cv",
-                    "metode": "Computer Vision Klasik (Haar/ROI + Multi-Exemplar Color-LBP 1-NN + LBPH)",
-                    "liveness": True,
-                    "liveness_skor": liveness_score,
-                    "distance_chi2_liveness": chi2_liveness,
-                    "distance_chi2_spoof": chi2_spoof,
-                    "threshold_chi2_liveness": _COLOR_LBP_THRESH,
-                    "skor": round(confidence, 3),
-                    "distance_chi2": round(best_dist, 2),
-                    "chi2_normalized": chi2_norm,
-                    "threshold_chi2": lbph_threshold,
-                    "threshold_chi2_norm": 0.53,
-                    "semua_jarak": all_distances,
-                    "dimensi_vektor": int(len(lbp_vec)),
-                    "tahapan": [
-                        "1. Akuisisi Gambar dari Kamera HP / Upload",
-                        "2. Deteksi & Cropping Region of Interest (Haar Cascade / Viola-Jones)",
-                        f"3. Gatekeeper 1 Liveness: Color-LBP 1-NN CrCb+HS 1024-D (χ² Real={chi2_liveness:.3f} < χ² Spoof={chi2_spoof:.3f} - REAL)",
-                        "4. Prapemrosesan Tekstur: Grayscale & Histogram Equalization",
-                        "5. Segmentasi Spasial Citra (Partisi Grid 8x8)",
-                        "6. Ekstraksi Pola Tekstur LBP (8-Tetangga Radius 1, 16.384 dimensi)",
-                        f"7. Gatekeeper 2 Identitas: Pencocokan Jarak Chi-Square (Chi2: {best_dist:.2f} vs Ambang {lbph_threshold})"
-                    ],
-                    "catatan": catatan,
-                    "previews": pipeline_previews,
-                    "bbox": bbox_info,
-                }
-            except Exception as exc:
-                return 500, {"error": f"ekstraksi CV gagal: {exc}"}
-
-        if not self.recognizer.ready:
-            return 503, {"error": "model belum dimuat", "alasan": self.recognizer.reason}
-        try:
-            import numpy as np
-            import cv2
-            arr = np.frombuffer(image_bytes, np.uint8)
-            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if frame is None:
-                return 400, {"error": "gambar tidak bisa di-decode"}
-
-            # Resize ke max 1280px agar YuNet bisa deteksi wajah di foto HP resolusi tinggi
-            frame = _resize_for_detection(frame, max_dim=1280)
-
-            details = self.detector.detect_detailed(frame)
-            accepted = [d for d in details if d["accepted"]]
-
-            if not accepted:
-                return 404, {"error": "tidak ada wajah terdeteksi di foto"}
-
-            best_d = accepted[0]
-            box0 = (best_d["x"], best_d["y"], best_d["w"], best_d["h"])
-            bbox_info = {
-                "x": int(best_d["x"]),
-                "y": int(best_d["y"]),
-                "w": int(best_d["w"]),
-                "h": int(best_d["h"]),
-                "frame_w": int(frame.shape[1]),
-                "frame_h": int(frame.shape[0]),
-            }
-
-            # Liveness: MiniFASNet + MCTA Guard
-            is_real, liveness_score = True, 1.0
-            catatan_spoof = "DITOLAK: spoof / wajah palsu terdeteksi"
-            if self.fas.ready:
-                is_real, liveness_score, _ = self.fas.check(frame, box0)
-                is_real = bool(is_real and liveness_score >= self.store.fas_threshold())
-
-            # Color-LBP Guard: tangkal serangan layar smartphone (OLED/AMOLED)
-            if is_real:
-                bx, by, bw, bh = box0
-                patch_crop = frame[max(0, by):min(frame.shape[0], by + bh), max(0, bx):min(frame.shape[1], bx + bw)]
-                if patch_crop.size > 0:
-                    is_real_clbp, clbp_score, chi2_live, *rest = _check_cv_liveness(patch_crop, threshold=_COLOR_LBP_THRESH)
-                    if not is_real_clbp:
-                        is_real = False
-                        liveness_score = round(float(clbp_score), 3)
-                        catatan_spoof = f"DITOLAK: spoof layar HP/cetak terdeteksi via Color-LBP 1-NN (χ² Real: {chi2_live:.3f})"
-
-            if not is_real:
-                return 403, {
-                    "granted": False,
-                    "wajah": None,
-                    "liveness": False,
-                    "liveness_skor": round(float(liveness_score), 3),
-                    "catatan": catatan_spoof,
-                    "bbox": bbox_info,
-                }
-
-            faces = self.store.prototypes()
-            if not faces:
-                return 200, {
-                    "granted": False,
-                    "wajah": None,
-                    "liveness": True,
-                    "liveness_skor": round(float(liveness_score), 3),
-                    "catatan": "wajah REAL, belum ada wajah terdaftar",
-                    "bbox": bbox_info,
-                }
-
-            emb = self.recognizer.embedding_from_frame(
-                frame, box0,
-                landmarks=best_d.get("landmarks"),
-                raw=best_d.get("raw"),
-                margin=self.store.margin(),
+            lbph_db = self.store.lbph_prototypes()
+            return recognize_cv(
+                image_bytes,
+                lbph_db=lbph_db,
+                real_mat=self._clbp_real,
+                spoof_mat=self._clbp_spoof,
+                lbp_thresh=self._clbp_thresh,
             )
-            if emb is None:
-                return 400, {"error": "crop wajah terlalu kecil"}
 
-            name, score = Recognizer.best_match(emb, faces)
-            granted = score >= self.store.threshold()
-            return 200, {
-                "granted": granted,
-                "wajah": name if granted else None,
-                "skor": round(score, 3),
-                "threshold": self.store.threshold(),
-                "liveness": True,
-                "liveness_skor": round(float(liveness_score), 3),
-                "catatan": (
-                    f"dikenali: {name}"
-                    if granted
-                    else "wajah REAL, skor di bawah threshold (unknown)"
-                ),
-                "bbox": bbox_info,
-            }
-        except Exception as exc:
-            return 500, {"error": f"recognize_photo gagal: {exc}"}
+        # mode == "ai" (default)
+        return recognize_ai(
+            image_bytes,
+            detector=self.detector,
+            recognizer=self.recognizer,
+            fas=self.fas,
+            store=self.store,
+            real_mat=self._clbp_real,
+            spoof_mat=self._clbp_spoof,
+            lbp_thresh=self._clbp_thresh,
+        )
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -873,23 +421,3 @@ class Engine:
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(timeout=2.0)
         self.grabber.release()
-
-
-# ---------------------------------------------------------------------------
-# Helper: parse source
-# ---------------------------------------------------------------------------
-
-def _parse_source(raw) -> tuple:
-    """
-    'none' -> (None, 'none')
-    '0'    -> (0, '0')      (webcam indeks)
-    'http://...' -> (url, url)
-    """
-    if raw is None:
-        return None, "none"
-    text = str(raw).strip()
-    if text.lower() == "none" or text == "":
-        return None, "none"
-    if text.isdigit():
-        return int(text), text
-    return text, text

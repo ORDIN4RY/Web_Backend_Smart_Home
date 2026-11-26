@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Environment & secrets
+.env
+*.log
+
+# Large backup data (auto-generated)
+api_data/backup/
+
+# Dataset gambar (terlalu besar untuk Git)
+Faza/
+Raffin/
+Rafi/
+spoof/
+dataset_unknown/
+
+# Artefak riset
+embeddings*.csv
+hasil_subplot*.png

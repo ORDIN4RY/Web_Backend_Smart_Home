@@ -27,8 +27,8 @@ import numpy as np
 # Tambahkan direktori saat ini ke sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core.detector import Detector
-from core.recognizer import Recognizer
+from core.ai.detector import Detector
+from core.ai.recognizer import Recognizer
 from core.store import Store
 
 

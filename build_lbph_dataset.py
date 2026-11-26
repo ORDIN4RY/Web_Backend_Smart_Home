@@ -1,5 +1,5 @@
-"""
-build_lbph_dataset.py — Ekstrak prototype LBPH dari folder foto dataset.
+﻿"""
+build_lbph_dataset.py â€” Ekstrak prototype LBPH dari folder foto dataset.
 Menggunakan 100% Classical Computer Vision: Haar Cascade Classifier (Viola-Jones).
 Jalankan:
   python build_lbph_dataset.py "path/ke/folder_dataset"
@@ -11,7 +11,7 @@ import glob
 import json
 import cv2
 import numpy as np
-from core.engine import _extract_lbp, _resize_for_detection
+from core.cv.lbph import extract_lbp
 
 
 def build_lbph_dataset(dataset_dir: str = ".", output_file: str = "api_data/faces_lbph.json"):
@@ -44,7 +44,10 @@ def build_lbph_dataset(dataset_dir: str = ".", output_file: str = "api_data/face
             if frame is None:
                 continue
 
-            frame = _resize_for_detection(frame, max_dim=640)
+            h_f, w_f = frame.shape[:2]
+            if max(h_f, w_f) > 640:
+                sc = 640 / max(h_f, w_f)
+                frame = cv2.resize(frame, (int(w_f * sc), int(h_f * sc)), interpolation=cv2.INTER_AREA)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
             if len(faces) == 0:
@@ -63,13 +66,13 @@ def build_lbph_dataset(dataset_dir: str = ".", output_file: str = "api_data/face
                     face_crop = frame[max(0, by):by+bh, max(0, bx):bx+bw]
             face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
             equalized = cv2.equalizeHist(face_gray)
-            features = _extract_lbp(equalized)
+            features = extract_lbp(equalized)
             histograms.append(features)
 
             # Ekstrak Color-LBP Cr+Cb untuk Liveness Prototype (Boulkenafet et al., IEEE TIFS 2016)
             ycrcb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2YCrCb)
-            h_cr = _extract_lbp(ycrcb[:, :, 1], grid_x=1, grid_y=1)
-            h_cb = _extract_lbp(ycrcb[:, :, 2], grid_x=1, grid_y=1)
+            h_cr = extract_lbp(ycrcb[:, :, 1], grid_x=1, grid_y=1)
+            h_cb = extract_lbp(ycrcb[:, :, 2], grid_x=1, grid_y=1)
             color_samples.append(np.concatenate([h_cr, h_cb]))
 
         if histograms:

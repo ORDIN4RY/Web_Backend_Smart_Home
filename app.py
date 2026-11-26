@@ -29,7 +29,7 @@ import signal
 import sys
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, jsonify
 from flask_cors import CORS
 
 # ---------------------------------------------------------------------------
@@ -66,43 +66,27 @@ def create_app(engine_cfg: dict) -> Flask:
     app.register_blueprint(config_bp)
     app.register_blueprint(devices_bp)
 
-    # ----- Interactive Web Demo Dashboard (Computer Vision & AI Visualizer) -----
-    @app.get("/demo")
-    def demo_page():
-        return render_template("demo.html")
-
-    # ----- Root endpoint: HTML untuk browser, JSON untuk API/cURL/Mobile -----
+    # ----- Root endpoint: API info (JSON) -----
     @app.get("/")
     def root():
-        accept = request.headers.get("Accept", "")
-        if "text/html" in accept and "application/json" not in accept:
-            return render_template("demo.html")
         return jsonify({
             "nama": "Smart House Face Recognition API",
             "versi": "2.0",
             "endpoints": {
-                "GET  /demo":                     "Dashboard Web Visualisasi Pipeline CV & Pengujian",
                 "GET  /api/health":               "Status semua komponen backend",
                 "GET  /api/status":               "Hasil recognition terakhir (dari kamera)",
                 "GET  /api/config":               "Konfigurasi aktif",
                 "GET  /api/faces":                "Daftar wajah terdaftar",
                 "POST /api/enroll":               "Daftarkan wajah dari kamera live",
                 "POST /api/enroll/photo":         "Daftarkan wajah dari foto upload (mobile)",
-                "POST /api/recognize":            "Kenali wajah dari foto upload (mobile & web demo)",
+                "POST /api/recognize":            "Kenali wajah dari foto upload (mobile)",
                 "DELETE /api/faces/<nama>":       "Hapus wajah dari database",
                 "POST /api/config/threshold":     "Ubah cosine threshold",
                 "POST /api/config/fas_threshold": "Ubah liveness threshold",
                 "POST /api/config/margin":        "Ubah margin crop",
             },
-            "dokumentasi": "Semua request/response dalam format JSON atau akses /demo untuk UI web",
+            "dokumentasi": "Semua request/response dalam format JSON",
         }), 200
-
-    @app.get("/api/sample/<path:filepath>")
-    def get_sample_image(filepath: str):
-        target = Path(filepath)
-        if target.exists() and target.is_file():
-            return send_file(target)
-        return jsonify({"error": f"file sampel '{filepath}' tidak ditemukan"}), 404
 
     # ----- Error handler global -----
     @app.errorhandler(404)
